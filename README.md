@@ -102,9 +102,24 @@ for that physical port and derives a temporary `/dev/ttyUSBx` path only when
 opening the serial port. The previous TTY name is never matched or fed back
 into `start`; `device` is cleared from the saved record when the daemon exits.
 
-An unplug or re-enumeration during the same boot invalidates the old serial
-mapping. It is never silently assigned to a device plugged in later; use
-`serial-bind` on the surviving daemon or start a new mapping explicitly.
+**The physical USB port is the alias' identity.** When the serial link drops
+(unplug, EMI, a USB-UART re-enumerating after a board reset) the daemon stays
+up, keeps the mapping and re-binds whatever TTY enumerates on the *same* port,
+even under a new `/dev/ttyUSBx` name:
+
+- it probes immediately, then every `serial_reconnect_interval` seconds
+  (default 1, `0` = only on input);
+- any key typed in `smtty` while the port is empty probes at once, so pressing
+  **Enter reconnects**; keys typed in the last `serial_input_hold_s` seconds
+  (default 3) are forwarded after re-binding, older ones are dropped;
+- clients see `serial lost` / `serial restored` and stay attached;
+- a TTY on a different port is never bound. `serial-unbind` (or `serial-bind`
+  to another device) is the only way to stop following a port.
+
+A saved alias whose port is empty (for example after a host reboot with the
+board unplugged) still starts and waits for the port. If the daemon itself
+dies, `smtty` reconnects and resumes it; any key retries at once
+(`client_reconnect_interval`, `client_reconnect_attempts`).
 
 #### Bind/unbind SSH at runtime
 
@@ -380,8 +395,8 @@ by the current sysfs reverse lookup.
 Device paths like `/dev/ttyUSB0` can change across host reboots. An alias
 records the physical USB port, boot ID, and enumeration instance so the same
 port can be resolved as `/dev/ttyUSB1` after reboot. A USB unplug or
-re-enumeration in the same boot invalidates the old mapping instead of
-silently reusing the alias.
+re-enumeration in the same boot keeps the mapping: the alias follows its
+physical port and re-binds when a TTY appears there again (see above).
 
 If no `--alias` is given, a saved alias for the same physical USB port is
 reused. Otherwise, the device basename is used (for example `ttyUSB0`).

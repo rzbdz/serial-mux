@@ -58,9 +58,17 @@ def test_attach_appends_live_output_after_history(
         None,
     ])
     readable = iter([[sock], [sock], [sock if disconnect else terminal]])
-    monkeypatch.setattr(
-        client, "connect", lambda *args, **kwargs: (sock, "serial"),
-    )
+    connects = []
+
+    def fake_connect(*args, **kwargs):
+        # A dropped daemon makes smtty reconnect; refuse the second attempt so
+        # the session ends and the rendered screen can be inspected.
+        connects.append(args)
+        if len(connects) > 1:
+            raise client.ConnectError("daemon gone", retryable=False)
+        return sock, "serial"
+
+    monkeypatch.setattr(client, "connect", fake_connect)
     monkeypatch.setattr(client, "sync_read_msg", lambda sock: next(messages))
     monkeypatch.setattr(client.sys, "stdin", terminal)
     monkeypatch.setattr(client.sys, "stdout", terminal)

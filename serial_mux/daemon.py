@@ -26,7 +26,13 @@ from .protocol import (
     HEADER_SIZE,
     MAX_MSG_SIZE,
 )
-from .state import get_boot_id, inspect_usb_device, mark_info_saved, write_info
+from .state import (
+    find_usb_device,
+    get_boot_id,
+    inspect_usb_device,
+    mark_info_saved,
+    write_info,
+)
 
 logger = logging.getLogger("serial-mux-daemon")
 
@@ -57,7 +63,8 @@ def validate_ssh_target(target: str) -> tuple[bool, str]:
 
 
 class SerialDaemon:
-    def __init__(self, device: Optional[str], baud: int, alias: str, config: Config):
+    def __init__(self, device: Optional[str], baud: int, alias: str, config: Config,
+                 usb_port: Optional[str] = None):
         self.device = device
         self.baud = baud
         self.alias = alias
@@ -84,6 +91,15 @@ class SerialDaemon:
         self.boot_id = get_boot_id()
         self._usb_info = inspect_usb_device(device)
         self._last_usb_check = 0.0
+        # The physical USB port this alias follows. It survives serial loss and
+        # re-enumeration and is cleared only by serial-bind/serial-unbind. A
+        # daemon resumed while the port is empty starts from the saved value.
+        self._usb_port: Optional[str] = self._usb_info.get("usb_port") or usb_port
+        if not self._usb_info and self._usb_port:
+            self._usb_info = {"usb_port": self._usb_port}
+        self._probe_now: Optional[asyncio.Event] = None
+        self._held_input: list[tuple[float, bytes]] = []
+        self._waiting_notified: set[asyncio.StreamWriter] = set()
 
     def _info_path(self) -> Path:
         return self.config.run_dir / f"{self.alias}.json"
@@ -114,6 +130,12 @@ class SerialDaemon:
             info["input_gate"] = True
             info["gate_note"] = self._gate_note
         info.update(self._usb_info)
+        if self.ser and self.ser.is_open:
+            info["serial_state"] = "open"
+        elif self._usb_port:
+            info["serial_state"] = "waiting"
+        else:
+            info["serial_state"] = "none"
         write_info(self._info_path(), info)
 
     def _write_pid(self):
@@ -211,11 +233,22 @@ class SerialDaemon:
         logger.info(f"Opened {self.device} at {self.baud} baud")
 
     async def _serial_reader(self):
-        """Read from serial port and fan out to all clients."""
+        """Read from serial port and fan out to all clients.
+
+        A USB serial port is followed by its physical port: when it is lost
+        (unplug, EMI, re-enumeration) the daemon stays up, keeps the mapping
+        and re-binds whatever TTY appears on the same port. Non-USB devices keep
+        the old behaviour and are unbound on error.
+        """
         loop = asyncio.get_event_loop()
         line_buf = bytearray()
 
         while self.running:
+            if not (self.ser and self.ser.is_open):
+                if not await self._reacquire_serial():
+                    break
+                line_buf.clear()
+                continue
             try:
                 data = await loop.run_in_executor(None, self._serial_read)
                 if not data:
@@ -236,24 +269,107 @@ class SerialDaemon:
                         line_buf.append(byte)
 
             except (serial.SerialException, OSError) as e:
-                logger.error(f"Serial error: {e}, unbinding serial")
-                # Don't kill the daemon — just unbind the dead serial port
-                if self.ser:
-                    try:
-                        self.ser.close()
-                    except Exception:
-                        pass
-                    self.ser = None
-                self.device = None
-                self._usb_info = {}
-                self._write_info()
-                await self._broadcast({"type": "serial_lost", "reason": str(e)})
-                break
+                if line_buf:  # keep a partial line rather than losing it
+                    line = line_buf.decode("utf-8", errors="replace").rstrip("\r")
+                    self._log_write(f"[{self._timestamp()}] {line}")
+                    line_buf.clear()
+                await self._lose_serial(str(e))
+                if not self._usb_port:
+                    break
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Serial reader error: {e}")
                 await asyncio.sleep(0.1)
+
+    async def _lose_serial(self, reason: str):
+        """Close a dead port. A USB mapping is kept so it can be re-bound."""
+        if self.ser:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+        self.device = None
+        if self._usb_port:
+            logger.error(f"Serial error: {reason}; waiting for USB port {self._usb_port}")
+            self._usb_info = {"usb_port": self._usb_port}
+        else:
+            logger.error(f"Serial error: {reason}, unbinding serial")
+            self._usb_info = {}
+        self._waiting_notified.clear()
+        self._write_info()
+        await self._broadcast({
+            "type": "serial_lost",
+            "reason": reason,
+            "usb_port": self._usb_port,
+            "waiting": bool(self._usb_port),
+        })
+
+    def _kick_probe(self):
+        if self._probe_now is not None:
+            self._probe_now.set()
+
+    async def _reacquire_serial(self) -> bool:
+        """Wait until a TTY enumerates on the followed USB port and open it.
+
+        Probes immediately, then every ``serial_reconnect_interval`` seconds,
+        and at once whenever a client types (``_kick_probe``). Returns False
+        when there is nothing to follow (no USB port) or the daemon stops.
+        """
+        if self._probe_now is None:
+            self._probe_now = asyncio.Event()
+        loop = asyncio.get_event_loop()
+        interval = self.config.serial_reconnect_interval
+        while self.running and self._usb_port:
+            port = self._usb_port
+            try:
+                device, usb_info = await loop.run_in_executor(None, find_usb_device, port)
+            except Exception as e:
+                logger.warning(f"USB port lookup failed: {e}")
+                device, usb_info = None, {}
+            if device and port == self._usb_port:
+                try:
+                    self.device = device
+                    self._open_serial()
+                except (serial.SerialException, OSError) as e:
+                    # Node exists but is not ready yet (udev permissions etc.)
+                    logger.warning(f"Re-bind of {device} failed: {e}")
+                    self.ser, self.device = None, None
+                else:
+                    self._usb_info = usb_info or {"usb_port": port}
+                    self._last_usb_check = 0.0
+                    self._write_info()
+                    logger.info(f"Serial restored on USB port {port}: {device}")
+                    await self._broadcast({"type": "serial_restored", "device": device, "usb_port": port})
+                    self._flush_held_input()
+                    return True
+            self._probe_now.clear()
+            try:
+                await asyncio.wait_for(self._probe_now.wait(), timeout=interval if interval > 0 else None)
+            except asyncio.TimeoutError:
+                pass
+        return False
+
+    def _hold_input(self, data: bytes):
+        """Keep keys typed while the port is absent, briefly and bounded."""
+        now = time.monotonic()
+        horizon = now - self.config.serial_input_hold_s
+        self._held_input = [(t, d) for t, d in self._held_input if t >= horizon]
+        if sum(len(d) for _, d in self._held_input) + len(data) <= 4096:
+            self._held_input.append((now, data))
+
+    def _flush_held_input(self):
+        """Forward recently typed keys (e.g. the Enter that triggered re-bind)."""
+        horizon = time.monotonic() - self.config.serial_input_hold_s
+        pending = b"".join(d for t, d in self._held_input if t >= horizon)
+        self._held_input.clear()
+        if pending and self.ser and self.ser.is_open:
+            try:
+                self.ser.write(pending)
+                self.ser.flush()
+            except (serial.SerialException, OSError) as e:
+                logger.warning(f"Could not forward held input: {e}")
 
     def _serial_read(self) -> bytes:
         """Blocking serial read (called in executor)."""
@@ -458,6 +574,20 @@ class SerialDaemon:
                 if self.ser and self.ser.is_open:
                     self.ser.write(data)
                     self.ser.flush()
+                elif self._usb_port:
+                    self._hold_input(data)
+                    self._kick_probe()
+                    if writer not in self._waiting_notified:
+                        self._waiting_notified.add(writer)
+                        await async_write_msg(writer, {
+                            "type": "serial_waiting",
+                            "usb_port": self._usb_port,
+                            "message": (
+                                f"no device on USB port {self._usb_port} yet; probing. "
+                                "Typed keys are sent if it returns within "
+                                f"{self.config.serial_input_hold_s:g}s"
+                            ),
+                        })
                 else:
                     await async_write_msg(writer, {
                         "type": "error",
@@ -564,9 +694,12 @@ class SerialDaemon:
         # Load existing history into ring buffer
         self.log_lines = self._load_history()
 
-        # Open serial if device specified
+        self._probe_now = asyncio.Event()
+        # Open serial if device specified; a device-less daemon that follows a
+        # USB port starts the reader anyway and waits for the port.
         if self.device:
             self._open_serial()
+        if self.device or self._usb_port:
             self._serial_task = asyncio.create_task(self._serial_reader())
 
         # Only publish a recoverable mapping after the serial port has opened.
@@ -687,6 +820,7 @@ class SerialDaemon:
             self.baud = baud
             self._open_serial()
             self._usb_info = inspect_usb_device(device)
+            self._usb_port = self._usb_info.get("usb_port")
             self._last_usb_check = 0.0
             self._serial_task = asyncio.create_task(self._serial_reader())
             self._write_info()
@@ -696,6 +830,7 @@ class SerialDaemon:
             logger.error(f"Failed to open serial {device}: {e}")
             self.device = None
             self._usb_info = {}
+            self._usb_port = None
             self._write_info()
             return False, str(e)
 
@@ -713,6 +848,8 @@ class SerialDaemon:
             self.ser = None
         self.device = None
         self._usb_info = {}
+        self._usb_port = None  # explicit unbind stops following the port
+        self._held_input.clear()
         self._write_info()
         logger.info("Serial unbound")
 
@@ -802,11 +939,16 @@ def daemonize():
     os.close(devnull)
 
 
-def start_daemon(device: Optional[str], baud: int, alias: str, foreground: bool = False, ssh_target: str = None):
-    """Start the daemon process."""
+def start_daemon(device: Optional[str], baud: int, alias: str, foreground: bool = False,
+                 ssh_target: str = None, usb_port: Optional[str] = None):
+    """Start the daemon process.
+
+    ``usb_port`` lets a saved USB alias start while its port is empty: the
+    daemon follows the port and binds the TTY as soon as it enumerates.
+    """
     config = Config.load()
 
-    if not device and not ssh_target:
+    if not device and not ssh_target and not usb_port:
         print("Error: At least one of device or --ssh must be specified")
         sys.exit(1)
 
@@ -877,7 +1019,7 @@ def start_daemon(device: Optional[str], baud: int, alias: str, foreground: bool 
             filename=str(log_path),
         )
 
-    daemon = SerialDaemon(device, baud, alias, config)
+    daemon = SerialDaemon(device, baud, alias, config, usb_port=usb_port)
     if ssh_target:
         daemon.ssh_target = ssh_target
     try:

@@ -21,6 +21,18 @@ from .protocol import sync_read_msg, sync_write_msg, b64, unb64
 from .state import info_is_running, reconcile_info
 
 
+class ConnectError(Exception):
+    """Raised when the client cannot connect to (or resume) a daemon.
+
+    ``retryable`` is False only for errors that will not resolve by waiting
+    (for example, no saved mapping exists for the alias).
+    """
+
+    def __init__(self, message: str, retryable: bool = True):
+        super().__init__(message)
+        self.retryable = retryable
+
+
 def _load_alias_info(config: Config, alias: str) -> dict | None:
     """Load and reconcile an alias record before it is used for recovery."""
     info_path = config.run_dir / f"{alias}.json"
@@ -64,17 +76,6 @@ def _auto_resume_daemon(config: Config, alias: str) -> bool:
     baud = info.get("baud", 115200)
     ssh_target = info.get("ssh")
     has_usb_mapping = bool(info.get("usb_port"))
-
-    if (
-        has_usb_mapping
-        and info.get("_device_status") == "unavailable"
-        and not ssh_target
-    ):
-        print(
-            f"Error: Saved USB port for '{alias}' is not available",
-            file=sys.stderr,
-        )
-        return False
 
     if not has_usb_mapping and not device and not ssh_target:
         return False
@@ -127,7 +128,8 @@ def connect(
     """Connect to daemon and perform handshake. Auto-resumes dead daemons.
 
     ``token`` is presented to the daemon's input gate; without a gate it has
-    no effect.
+    no effect. Raises :class:`ConnectError` when the daemon cannot be reached;
+    its ``retryable`` flag tells interactive mode whether to keep trying.
     """
     sock_path = resolve_socket(config, alias)
 
@@ -137,14 +139,17 @@ def connect(
         if _is_daemon_dead(config, alias):
             need_resume = True
         else:
-            print(f"Error: No daemon found for '{alias}'", file=sys.stderr)
-            print(f"Start one with: serial-mux start <device> --alias {alias}", file=sys.stderr)
-            sys.exit(1)
+            raise ConnectError(
+                f"No daemon found for '{alias}'. "
+                f"Start one with: serial-mux start <device> --alias {alias}",
+                retryable=False,
+            )
     elif not Path(sock_path).exists():
         need_resume = _is_daemon_dead(config, alias)
         if not need_resume:
-            print(f"Error: Socket {sock_path} not found. Daemon may have crashed.", file=sys.stderr)
-            sys.exit(1)
+            raise ConnectError(
+                f"Socket {sock_path} not found. Daemon may have crashed."
+            )
 
     if not need_resume and sock_path:
         # Try connecting — may get ConnectionRefused if socket file is stale
@@ -155,17 +160,17 @@ def connect(
             sock.close()
             need_resume = _is_daemon_dead(config, alias)
             if not need_resume:
-                print(f"Error: Connection refused to '{alias}'. Daemon may have crashed.", file=sys.stderr)
-                sys.exit(1)
+                raise ConnectError(
+                    f"Connection refused to '{alias}'. Daemon may have crashed."
+                )
 
     if need_resume:
         if not _auto_resume_daemon(config, alias):
-            sys.exit(1)
+            raise ConnectError(f"Failed to resume daemon '{alias}'")
         # Re-resolve socket after restart
         sock_path = resolve_socket(config, alias)
         if not sock_path:
-            print(f"Error: Daemon resumed but socket path not found", file=sys.stderr)
-            sys.exit(1)
+            raise ConnectError("Daemon resumed but socket path not found")
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(sock_path)
 
@@ -178,8 +183,8 @@ def connect(
     # Read hello_ack
     msg = sync_read_msg(sock)
     if not msg or msg.get("type") != "hello_ack":
-        print(f"Error: Unexpected response from daemon", file=sys.stderr)
-        sys.exit(1)
+        sock.close()
+        raise ConnectError("Unexpected response from daemon")
 
     # Store transport type for later use
     transport_type = msg.get("transport", "serial")
@@ -405,154 +410,243 @@ def _rejection_text(msg: dict) -> str:
     return msg.get("message", "input refused") + (f" ({note})" if note else "")
 
 
+def _write_status(output_fd: int, text: str) -> None:
+    """Write a status line framed for raw terminal mode."""
+    os.write(output_fd, f"\r\n--- serial-mux: {text} ---\r\n".encode("utf-8", errors="replace"))
+
+
+def _replay_history(history_msg, timestamps: bool, output_fd: int) -> None:
+    """Replay sanitized, de-duplicated scrollback in raw mode."""
+    if not history_msg or history_msg.get("type") != "history":
+        return
+    cleaned = []
+    seen_window = deque(maxlen=5)
+    for line in history_msg.get("lines", []):
+        text = line if timestamps else _strip_timestamp(line)
+        text = _sanitize_history_line(text)
+        # Compare by plain text (no SGR, no trailing whitespace)
+        plain = _SGR_RE.sub("", text).strip()
+        if not plain or plain in seen_window:
+            continue
+        seen_window.append(plain)
+        cleaned.append(text)
+    for text in cleaned:
+        os.write(output_fd, (text + "\r\n").encode("utf-8", errors="replace"))
+    # Sanitized history can only change SGR. Reset attributes here, not
+    # margins/origin mode: those controls home the cursor and would make
+    # the banner and live output overwrite the history just displayed.
+    _write_terminal_sequence(output_fd, b"\x1b[0m")
+
+
+def _session_loop(sock: socket.socket, timestamps: bool, input_fd: int,
+                  output_fd: int, pending_input: bytes = b"") -> str:
+    """Run one attached session. Returns ``"detached"`` or ``"lost"``.
+
+    ``pending_input`` (keys typed while reconnecting) is sent first, so the
+    Enter that triggered a reconnect still reaches the board.
+    """
+    terminal_owner = True
+    query_filter = _TerminalQueryFilter()
+    last_output_was_newline = True
+
+    if pending_input:
+        try:
+            sync_write_msg(sock, {"type": "input", "data": b64(pending_input)})
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return "lost"
+
+    while True:
+        try:
+            readable, _, _ = select.select([sys.stdin, sock], [], [], 0.1)
+        except (ValueError, OSError):
+            return "lost"
+
+        if sys.stdin in readable:
+            try:
+                ch = os.read(input_fd, 1)
+            except OSError:
+                return "detached"
+            if not ch or ch == b"\x1d":  # EOF or Ctrl+]
+                return "detached"
+
+            # If timestamps enabled, handle input newline
+            if timestamps and ch in (b"\r", b"\n"):
+                ts = datetime.now().strftime("%H:%M:%S")
+                # Use \r\n to ensure proper cursor movement in raw mode
+                os.write(output_fd, f" [{ts}]\r\n".encode("utf-8"))
+
+            try:
+                sync_write_msg(sock, {"type": "input", "data": b64(ch)})
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return "lost"
+
+        if sock in readable:
+            try:
+                # Switch to blocking with timeout for reliable message framing.
+                # Non-blocking reads can lose partial header bytes on EAGAIN,
+                # corrupting the stream and causing hangs.
+                sock.setblocking(True)
+                sock.settimeout(2.0)
+                msg = sync_read_msg(sock)
+                sock.setblocking(False)
+                if msg is None:
+                    return "lost"
+
+                message_type = msg.get("type")
+                if message_type == "terminal_owner":
+                    terminal_owner = bool(msg.get("active"))
+                    query_filter.reset()
+                elif message_type == "input_rejected":
+                    _write_status(output_fd, f"{_rejection_text(msg)}; output still shows")
+                    last_output_was_newline = True
+                elif message_type == "serial_lost":
+                    _write_status(
+                        output_fd,
+                        f"serial lost ({msg.get('reason', 'unknown')}); "
+                        "press Enter or wait to reconnect",
+                    )
+                    last_output_was_newline = True
+                elif message_type == "serial_waiting":
+                    _write_status(output_fd, msg.get("message", "serial not present yet"))
+                    last_output_was_newline = True
+                elif message_type == "serial_restored":
+                    _write_status(output_fd, f"serial restored: {msg.get('device', 'unknown')}")
+                    last_output_was_newline = True
+                elif message_type == "transport_changed":
+                    _write_status(output_fd, f"transport switched to {msg.get('transport')}")
+                    last_output_was_newline = True
+                elif message_type == "output":
+                    data = unb64(msg["data"])
+                    if not terminal_owner:
+                        data = query_filter.feed(data)
+                    if not data:
+                        continue
+                    if not timestamps:
+                        os.write(output_fd, data)
+                    else:
+                        # Insert timestamps at the beginning of each line.
+                        for b in data:
+                            if last_output_was_newline:
+                                ts = datetime.now().strftime("[%H:%M:%S] ")
+                                os.write(output_fd, ts.encode("utf-8"))
+                                last_output_was_newline = False
+                            char_bytes = bytes([b])
+                            os.write(output_fd, char_bytes)
+                            if char_bytes == b"\n":
+                                last_output_was_newline = True
+
+            except (TimeoutError, socket.timeout):
+                # Timeout reading a complete message — switch back to non-blocking
+                sock.setblocking(False)
+            except (ConnectionResetError, BrokenPipeError):
+                return "lost"
+            except Exception:
+                sock.setblocking(False)
+
+
+def _wait_before_retry(input_fd: int, seconds: float) -> tuple[bool, bytes]:
+    """Wait up to ``seconds`` before the next reconnect attempt.
+
+    Returns ``(keep_going, typed)``. Any key cuts the wait short so pressing
+    Enter retries immediately; the keys are returned to be replayed once the
+    session is back. Ctrl+] (or EOF) gives up.
+    """
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True, b""
+        try:
+            readable, _, _ = select.select([sys.stdin], [], [], min(remaining, 0.1))
+        except (ValueError, OSError):
+            return False, b""
+        if sys.stdin in readable:
+            try:
+                data = os.read(input_fd, 64)
+            except OSError:
+                return False, b""
+            if not data or b"\x1d" in data:
+                return False, b""
+            return True, data
+
+
+def _should_reconnect(config: Config, attempt: int) -> bool:
+    """Return True if the client should keep trying to reconnect."""
+    max_attempts = getattr(config, "client_reconnect_attempts", 0)
+    return max_attempts <= 0 or attempt <= max_attempts
+
+
 def interactive_mode(config: Config, alias: str, timestamps: bool = False,
                      token: str | None = None):
-    """Interactive attach mode — like tio/minicom but multiplexed."""
-    sock, transport = connect(config, alias, interactive=True, token=token)
+    """Interactive attach mode — like tio/minicom but multiplexed.
 
-    # Read history (will be replayed after entering raw mode)
-    history_msg = sync_read_msg(sock)
-
-    # Save terminal state and switch to raw mode
+    Survives both kinds of loss without the user re-running smtty:
+    * serial loss: the daemon stays up, reports ``serial_lost`` and re-binds the
+      device on the same USB port (pressing Enter makes it re-probe at once);
+    * daemon loss: this loop reconnects (auto-resuming the daemon); pressing
+      Enter retries immediately instead of waiting for the next interval.
+    """
     input_fd = sys.stdin.fileno()
     output_fd = sys.stdout.fileno()
     old_settings = termios.tcgetattr(input_fd)
     exit_message = None
-    terminal_owner = True
-    query_filter = _TerminalQueryFilter()
+    attempt = 0
+    pending = b""
 
     try:
         tty.setraw(input_fd)
         _normalize_local_terminal(output_fd)
-        sock.setblocking(False)
-
-        # Replay history in raw mode so terminal handles it cleanly
-        if history_msg and history_msg.get("type") == "history":
-            raw_lines = history_msg.get("lines", [])
-            # Sanitize and deduplicate history lines
-            cleaned = []
-            seen_window = deque(maxlen=5)
-            for line in raw_lines:
-                text = line if timestamps else _strip_timestamp(line)
-                text = _sanitize_history_line(text)
-                # Compare by plain text (no SGR, no trailing whitespace)
-                plain = _SGR_RE.sub("", text).strip()
-                if not plain or plain in seen_window:
-                    continue
-                seen_window.append(plain)
-                cleaned.append(text)
-            for text in cleaned:
-                data = (text + "\r\n").encode(
-                    "utf-8",
-                    errors="replace",
-                )
-                os.write(output_fd, data)
-
-        # Sanitized history can only change SGR. Reset attributes here, not
-        # margins/origin mode: those controls home the cursor and would make
-        # the banner and live output overwrite the history just displayed.
-        _write_terminal_sequence(output_fd, b"\x1b[0m")
-
-        print(
-            f"\r\n--- serial-mux: attached to {alias} "
-            f"[{transport}] (Ctrl+] to detach) ---\r\n",
-            end="",
-            flush=True,
-        )
-
-        last_output_was_newline = True
 
         while True:
-            readable, _, _ = select.select([sys.stdin, sock], [], [], 0.1)
-
-            if sys.stdin in readable:
-                try:
-                    ch = os.read(input_fd, 1)
-                except OSError:
+            try:
+                sock, transport = connect(config, alias, interactive=True, token=token)
+                history_msg = sync_read_msg(sock)
+            except ConnectError as e:
+                if not e.retryable or not _should_reconnect(config, attempt + 1):
+                    exit_message = f"cannot connect: {e}"
+                    break
+                attempt += 1
+                if attempt == 1 or pending:
+                    _write_status(output_fd, f"{e}; reconnecting (Enter = retry now, Ctrl+] = quit)")
+                keep_going, typed = _wait_before_retry(input_fd, getattr(config, "client_reconnect_interval", 1.0))
+                if not keep_going:
                     exit_message = "detached"
                     break
-                if not ch:
+                pending += typed
+                continue
+            except (OSError, EOFError) as e:
+                attempt += 1
+                keep_going, typed = _wait_before_retry(input_fd, getattr(config, "client_reconnect_interval", 1.0))
+                if not keep_going:
                     exit_message = "detached"
                     break
-                # Ctrl+] to detach
-                if ch == b"\x1d":
-                    exit_message = "detached"
-                    break
+                pending += typed
+                continue
 
-                # If timestamps enabled, handle input newline
-                if timestamps and ch in (b"\r", b"\n"):
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    # Use \r\n to ensure proper cursor movement in raw mode
-                    os.write(output_fd, f" [{ts}]\r\n".encode("utf-8"))
+            if attempt:
+                _write_status(output_fd, "reconnected")
+            attempt = 0
+            sock.setblocking(False)
+            _replay_history(history_msg, timestamps, output_fd)
+            print(
+                f"\r\n--- serial-mux: attached to {alias} "
+                f"[{transport}] (Ctrl+] to detach) ---\r\n",
+                end="",
+                flush=True,
+            )
 
-                # Send to daemon
-                try:
-                    sync_write_msg(sock, {"type": "input", "data": b64(ch)})
-                except (BrokenPipeError, ConnectionResetError):
-                    exit_message = "connection lost"
-                    break
-
-            if sock in readable:
-                try:
-                    # Switch to blocking with timeout for reliable message framing.
-                    # Non-blocking reads can lose partial header bytes on EAGAIN,
-                    # corrupting the stream and causing hangs.
-                    sock.setblocking(True)
-                    sock.settimeout(2.0)
-                    msg = sync_read_msg(sock)
-                    sock.setblocking(False)
-                    if msg is None:
-                        exit_message = "daemon disconnected"
-                        break
-
-                    message_type = msg.get("type")
-                    if message_type == "terminal_owner":
-                        terminal_owner = bool(msg.get("active"))
-                        query_filter.reset()
-                    elif message_type == "input_rejected":
-                        os.write(
-                            output_fd,
-                            f"\r\n--- serial-mux: {_rejection_text(msg)}; "
-                            f"output still shows ---\r\n".encode("utf-8"),
-                        )
-                        last_output_was_newline = True
-                    elif message_type == "output":
-                        data = unb64(msg["data"])
-                        if not terminal_owner:
-                            data = query_filter.feed(data)
-                        if not data:
-                            continue
-                        if not timestamps:
-                            os.write(output_fd, data)
-                        else:
-                            # Insert timestamps at the beginning of each line.
-                            for b in data:
-                                if last_output_was_newline:
-                                    ts = datetime.now().strftime(
-                                        "[%H:%M:%S] "
-                                    )
-                                    os.write(output_fd, ts.encode("utf-8"))
-                                    last_output_was_newline = False
-
-                                char_bytes = bytes([b])
-                                os.write(output_fd, char_bytes)
-                                if char_bytes == b"\n":
-                                    last_output_was_newline = True
-
-                except (TimeoutError, socket.timeout):
-                    # Timeout reading a complete message — switch back to non-blocking
-                    sock.setblocking(False)
-                except (ConnectionResetError, BrokenPipeError):
-                    exit_message = "connection lost"
-                    break
-                except Exception:
-                    sock.setblocking(False)
+            try:
+                outcome = _session_loop(sock, timestamps, input_fd, output_fd, pending)
+            finally:
+                sock.close()
+            pending = b""
+            if outcome == "detached":
+                exit_message = "detached"
+                break
+            _write_status(output_fd, "daemon connection lost; reconnecting (Enter = retry now)")
 
     finally:
-        try:
-            _restore_local_terminal(input_fd, output_fd, old_settings)
-        finally:
-            sock.close()
+        _restore_local_terminal(input_fd, output_fd, old_settings)
 
     if exit_message:
         print(f"--- {exit_message} ---\r\n", end="", flush=True)
@@ -568,7 +662,11 @@ def noninteractive_mode(config: Config, alias: str,
                          send_cmd: str, wait_pattern: str = None,
                          timeout: float = 10.0, token: str | None = None):
     """Non-interactive mode: send a command once, then wait for output."""
-    sock, _transport = connect(config, alias, token=token)
+    try:
+        sock, _transport = connect(config, alias, token=token)
+    except ConnectError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     # Drain history
     msg = sync_read_msg(sock)  # history message

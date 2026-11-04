@@ -167,10 +167,18 @@ def find_usb_device(usb_port: str) -> tuple[Optional[str], dict[str, str]]:
 def resolve_recorded_device(info: dict) -> tuple[Optional[str], str]:
     """Resolve a saved USB port to its current TTY and classify its state.
 
-    The returned status is one of ``plain``, ``connected``, ``rebooted``,
-    ``unavailable``, ``disconnected``, or ``replugged``. The last two mean a
-    hotplug event happened during the same boot and the mapping must be
-    invalidated.
+    Identity is the physical USB port: whatever TTY currently enumerates on
+    ``usb_port`` belongs to the alias. The returned status is one of:
+
+    ``plain``         no USB identity, the recorded path is used as-is
+    ``connected``     same boot, same enumeration instance
+    ``reenumerated``  same boot, the port re-enumerated (EMI, cable glitch,
+                      board reset of a USB-UART bridge, replug)
+    ``rebooted``      host rebooted, port present again
+    ``disconnected``  same boot, nothing on the port right now
+    ``unavailable``   host rebooted, nothing on the port right now
+
+    The last two keep the mapping: the daemon waits for the port to come back.
     """
     usb_port = info.get("usb_port")
     if not usb_port:
@@ -193,7 +201,7 @@ def resolve_recorded_device(info: dict) -> tuple[Optional[str], str]:
     saved_instance = info.get("usb_instance")
     current_instance = current_usb.get("usb_instance")
     if same_boot and saved_instance and current_instance != saved_instance:
-        return None, "replugged"
+        return current_device, "reenumerated"
     return current_device, "connected"
 
 
@@ -275,13 +283,8 @@ def reconcile_info(path: Path, info: dict) -> Optional[dict]:
         result["clients_count"] = 0
 
     device, status = resolve_recorded_device(result)
-    if status in {"disconnected", "replugged"}:
-        result = clear_serial_mapping(path, result)
-        if result is not None:
-            result["_device_status"] = status
-        return result
-
-    if status == "unavailable":
+    if status in {"disconnected", "unavailable"}:
+        # Keep the USB port: a resumed daemon waits for it to come back.
         result["device"] = None
     elif device:
         result["device"] = device

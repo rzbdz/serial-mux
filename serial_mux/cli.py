@@ -102,15 +102,17 @@ def cmd_start(args):
         or config.default_baud
     )
 
-    if not device and not ssh_target:
-        if saved and saved.get("_device_status") == "unavailable":
-            print(
-                f"Error: Saved USB port for '{saved.get('alias')}' "
-                "is not available"
-            )
-            sys.exit(1)
+    # A saved USB alias whose port is empty right now still starts: the daemon
+    # follows the physical port and binds whatever TTY enumerates there.
+    usb_port = saved.get("usb_port") if saved and not getattr(args, "device", None) else None
+    if not device and not ssh_target and not usb_port:
         print("Error: At least one of DEVICE or --ssh must be specified")
         sys.exit(1)
+    if usb_port and not device:
+        print(
+            f"Note: nothing on USB port {usb_port} yet; '{alias}' will bind it "
+            "when it appears"
+        )
 
     if not alias:
         if device:
@@ -140,12 +142,14 @@ def cmd_start(args):
 
     # Import and start daemon
     from .daemon import start_daemon
+    extra = {"usb_port": usb_port} if usb_port and not device else {}
     start_daemon(
         device,
         baud,
         alias,
         foreground=args.foreground,
         ssh_target=ssh_target,
+        **extra,
     )
 
 
@@ -266,6 +270,9 @@ def cmd_status(args):
     usb_port = info.get("usb_port")
     if usb_port:
         print(f"USB Port: {usb_port}")
+        state = info.get("serial_state")
+        if state:
+            print(f"Serial: {'waiting for USB port' if state == 'waiting' else state}")
     ssh = info.get("ssh")
     print(f"SSH:     {ssh if ssh else 'none'}")
     if running and info.get("input_gate"):

@@ -273,3 +273,41 @@ def test_auto_resume_usb_uses_alias_not_saved_device(tmp_config, monkeypatch):
         "--alias",
         alias,
     ]]
+
+
+def test_enter_while_daemon_is_down_retries_at_once_and_is_replayed(monkeypatch):
+    """smtty: a key typed while reconnecting skips the wait and reaches the board."""
+    import time as _time
+    from types import SimpleNamespace
+
+    sock = FakeSocket()
+    fake_stdin = FakeTTY(10)
+    fake_stdout = FakeTTY(11)
+    attempts = []
+    sent = []
+    keys = iter([b"\r", b"\x1d"])
+
+    def fake_connect(config, alias, interactive=False, token=None):
+        attempts.append(_time.monotonic())
+        if len(attempts) == 1:
+            raise client.ConnectError("daemon restarting")
+        return sock, "serial"
+
+    monkeypatch.setattr(client, "connect", fake_connect)
+    monkeypatch.setattr(client, "sync_read_msg", lambda s: {"type": "history", "lines": []})
+    monkeypatch.setattr(client, "sync_write_msg", lambda s, m: sent.append(m))
+    monkeypatch.setattr(client.sys, "stdin", fake_stdin)
+    monkeypatch.setattr(client.sys, "stdout", fake_stdout)
+    monkeypatch.setattr(client.os, "isatty", lambda fd: True)
+    monkeypatch.setattr(client.os, "write", lambda fd, data: len(data))
+    monkeypatch.setattr(client.os, "read", lambda fd, size: next(keys))
+    monkeypatch.setattr(client.select, "select", lambda *args: ([fake_stdin], [], []))
+    monkeypatch.setattr(client.termios, "tcgetattr", lambda fd: "saved")
+    monkeypatch.setattr(client.termios, "tcsetattr", lambda *args: None)
+    monkeypatch.setattr(client.tty, "setraw", lambda fd: None)
+
+    cfg = SimpleNamespace(client_reconnect_interval=30.0, client_reconnect_attempts=0)
+    client.interactive_mode(cfg, "board1")
+
+    assert len(attempts) == 2 and attempts[1] - attempts[0] < 1.0   # did not wait 30s
+    assert sent and sent[0] == {"type": "input", "data": client.b64(b"\r")}

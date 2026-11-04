@@ -30,6 +30,10 @@ Daemon -> Client:
   {"type": "ssh_bind_ack", "target": "...", "ok": true/false, "message": "..."}
   {"type": "serial_bind_ack", "device": "...", "ok": true/false, "message": "..."}
   {"type": "transport_changed", "transport": "ssh"|"serial"}
+  {"type": "serial_lost", "reason": "...", "usb_port": "..."|null, "waiting": bool}
+  {"type": "serial_waiting", "usb_port": "...", "message": "..."}
+      (input arrived while the USB port is empty; once per client per loss)
+  {"type": "serial_restored", "device": "/dev/ttyUSBn", "usb_port": "..."}
   {"type": "terminal_owner", "active": true|false}
   {"type": "gate_ack", "enabled": true|false, "note": "..."|null}
   {"type": "input_rejected", "message": "...", "note": "..."|null}

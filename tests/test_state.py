@@ -83,7 +83,8 @@ def test_usb_port_survives_reboot_and_resolves_new_tty(
     assert json.loads(info_path.read_text())["device"] is None
 
 
-def test_usb_replug_in_same_boot_invalidates_mapping(fake_usb_sysfs):
+def test_usb_reenumeration_in_same_boot_keeps_mapping(fake_usb_sysfs):
+    """The physical port is the identity: a new enumeration on it is the same alias."""
     device = str(fake_usb_sysfs["dev_dir"] / "ttyUSB0")
     usb = state.inspect_usb_device(device)
     info = {
@@ -96,8 +97,8 @@ def test_usb_replug_in_same_boot_invalidates_mapping(fake_usb_sysfs):
 
     resolved, status = state.resolve_recorded_device(info)
 
-    assert resolved is None
-    assert status == "replugged"
+    assert resolved == device
+    assert status == "reenumerated"
 
 
 def test_usb_port_identity_normalizes_root_bus_number(fake_usb_sysfs):
@@ -118,7 +119,7 @@ def test_usb_port_identity_normalizes_root_bus_number(fake_usb_sysfs):
     assert new["usb_instance"] != old["usb_instance"]
 
 
-def test_disconnected_usb_removes_inactive_serial_only_mapping(
+def test_disconnected_usb_keeps_inactive_serial_only_mapping(
     tmp_path, fake_usb_sysfs
 ):
     device = str(fake_usb_sysfs["dev_dir"] / "ttyUSB0")
@@ -136,8 +137,12 @@ def test_disconnected_usb_removes_inactive_serial_only_mapping(
 
     reconciled = state.reconcile_info(info_path, info)
 
-    assert reconciled is None
-    assert not info_path.exists()
+    # The alias keeps following the port; a resumed daemon waits for it.
+    assert reconciled["device"] is None
+    assert reconciled["_device_status"] == "disconnected"
+    persisted = json.loads(info_path.read_text())
+    assert persisted["usb_port"] == info["usb_port"]
+    assert persisted["device"] is None
 
 
 def test_disconnected_usb_keeps_ssh_mapping(tmp_path, fake_usb_sysfs):
@@ -160,7 +165,7 @@ def test_disconnected_usb_keeps_ssh_mapping(tmp_path, fake_usb_sysfs):
     assert reconciled["ssh"] == "root@board"
     persisted = json.loads(info_path.read_text())
     assert persisted["device"] is None
-    assert "usb_port" not in persisted
+    assert persisted["usb_port"] == info["usb_port"]
 
 
 def test_boot_id_prevents_recycled_pid_from_looking_alive(monkeypatch):
@@ -218,7 +223,7 @@ def test_serial_read_propagates_disconnect_error(tmp_config):
         daemon._serial_read()
 
 
-def test_serial_disconnect_clears_live_mapping(tmp_config, monkeypatch):
+def test_serial_disconnect_keeps_usb_port_and_waits(tmp_config, monkeypatch):
     class DisconnectedSerial:
         is_open = True
 
@@ -229,7 +234,15 @@ def test_serial_disconnect_clears_live_mapping(tmp_config, monkeypatch):
     daemon.ser = DisconnectedSerial()
     daemon.running = True
     daemon._usb_info = {"usb_port": "port", "usb_instance": "1:4"}
+    daemon._usb_port = "port"
     daemon._write_info()
+
+    def port_still_empty(port):
+        assert port == "port"
+        daemon.running = False  # stop after the first probe
+        return None, {}
+
+    monkeypatch.setattr("serial_mux.daemon.find_usb_device", port_still_empty)
     monkeypatch.setattr(
         daemon,
         "_serial_read",
@@ -237,8 +250,8 @@ def test_serial_disconnect_clears_live_mapping(tmp_config, monkeypatch):
     )
 
     class InlineLoop:
-        async def run_in_executor(self, _executor, function):
-            return function()
+        async def run_in_executor(self, _executor, function, *args):
+            return function(*args)
 
     monkeypatch.setattr("serial_mux.daemon.asyncio.get_event_loop", InlineLoop)
     broadcasts = []
@@ -253,8 +266,43 @@ def test_serial_disconnect_clears_live_mapping(tmp_config, monkeypatch):
     info = json.loads(daemon._info_path().read_text())
     assert daemon.device is None
     assert info["device"] is None
-    assert "usb_port" not in info
-    assert broadcasts == [{"type": "serial_lost", "reason": "unplugged"}]
+    assert info["usb_port"] == "port"
+    assert info["serial_state"] == "waiting"
+    assert broadcasts == [{
+        "type": "serial_lost", "reason": "unplugged", "usb_port": "port", "waiting": True,
+    }]
+
+
+def test_serial_disconnect_without_usb_port_unbinds(tmp_config, monkeypatch):
+    """Non-USB devices keep upstream behaviour: unbind, no reconnect loop."""
+    class DisconnectedSerial:
+        is_open = True
+
+        def close(self):
+            self.is_open = False
+
+    daemon = SerialDaemon("/dev/ttyS9", 115200, "die1", tmp_config)
+    daemon.ser = DisconnectedSerial()
+    daemon.running = True
+    monkeypatch.setattr(
+        daemon, "_serial_read",
+        lambda: (_ for _ in ()).throw(serial.SerialException("gone")),
+    )
+
+    class InlineLoop:
+        async def run_in_executor(self, _executor, function, *args):
+            return function(*args)
+
+    monkeypatch.setattr("serial_mux.daemon.asyncio.get_event_loop", InlineLoop)
+
+    async def ignore(_message):
+        pass
+
+    monkeypatch.setattr(daemon, "_broadcast", ignore)
+    asyncio.run(daemon._serial_reader())
+
+    info = json.loads(daemon._info_path().read_text())
+    assert info["serial_state"] == "none" and "usb_port" not in info
 
 
 def test_daemon_info_contains_boot_and_usb_identity(

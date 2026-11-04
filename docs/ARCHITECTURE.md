@@ -104,8 +104,14 @@ daemon 同时管理串口和 SSH 两个 I/O 通道。当 SSH 已连接时，所�
 ## alias 机制
 
 设备路径在系统重启后可能变化（例如 ttyUSB0 变成 ttyUSB1）。alias 记录物理 USB
-端口、boot ID 与枚举实例：跨系统重启时按物理端口恢复；同一次开机中的 USB
-拔出或重新枚举则清除旧串口映射，避免 alias 错绑到后来插入的设备。
+端口、boot ID 与枚举实例。**物理 USB 端口就是 alias 的身份**：跨系统重启时按物理端口恢复；
+同一次开机中的 USB 拔出 / EMI / 重新枚举时，daemon 不退出、保留映射，并重新绑定
+同一端口上出现的 tty（名字可以变，如 ttyUSB0 → ttyUSB1）。其它端口上的设备永不绑定。
+
+重连触发：丢失后立即探测，此后每 `serial_reconnect_interval` 秒一次（0 = 只在输入时）；
+客户端在端口为空时的任何输入都会立刻触发探测（smtty 里按回车即重连），最近
+`serial_input_hold_s` 秒内的按键在重绑后转发，更早的丢弃。只有 `serial-unbind` /
+`serial-bind` 才会停止跟随该端口。
 
 持久恢复只以 `usb_port` 为键，扫描 `/sys/class/tty/*/device` 反查当前 tty。
 `device` 是运行态结果，daemon 退出时写为 `null`，不参与重启后的匹配。
@@ -205,7 +211,8 @@ smtty die0 --send "ls" --wait "root@" --timeout 5
 - `start` / `status` 时检查 PID file 对应的进程是否存在
 - 进程不在则自动清理 stale PID file 和 socket 文件，但保留可恢复的 alias JSON
 - `list` 将这种记录显示为 `saved`；`smtty <alias>` 会按保存的信息自动恢复 daemon
-- 同一次开机中 USB 被拔出或重新枚举时，清除旧串口映射
+- 同一次开机中 USB 被拔出或重新枚举时保留映射（`serial_state: waiting`），端口重新出现即重绑
+- daemon 自身退出时，smtty 自动重连并恢复 daemon；任意按键立即重试
 
 ## 文件布局
 
