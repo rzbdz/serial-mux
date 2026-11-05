@@ -76,7 +76,7 @@ def test_attach_appends_live_output_after_history(
     monkeypatch.setattr(
         client.os, "write", lambda fd, data: terminal.feed(data),
     )
-    monkeypatch.setattr(client.os, "read", lambda fd, count: b"\x1d")
+    monkeypatch.setattr(client.os, "read", lambda fd, count: b"\x01\x18")
     monkeypatch.setattr(client.termios, "tcgetattr", lambda fd: [])
     monkeypatch.setattr(client.termios, "tcsetattr", lambda *args: None)
     monkeypatch.setattr(client.tty, "setraw", lambda fd: None)

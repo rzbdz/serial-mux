@@ -438,6 +438,44 @@ def _replay_history(history_msg, timestamps: bool, output_fd: int) -> None:
     _write_terminal_sequence(output_fd, b"\x1b[0m")
 
 
+ESCAPE = b"\x01"          # Ctrl-A starts a command, as in picocom
+QUIT_KEYS = (b"\x18", b"\x11")   # then Ctrl-X or Ctrl-Q leaves
+HELP_KEYS = (b"\x08", b"\x7f", b"?")
+ESCAPE_HELP = ("\r\n*** smtty: Ctrl-A Ctrl-X (or Ctrl-Q) leaves, Ctrl-A Ctrl-A sends Ctrl-A, "
+               "Ctrl-A Ctrl-H shows this help ***\r\n")
+
+
+class EscapeKeys:
+    """Reads typed keys the way picocom does: Ctrl-A starts a command, and every other key,
+    Ctrl-C and Ctrl-] included, goes to the board."""
+
+    def __init__(self) -> None:
+        self.armed = False
+
+    def feed(self, data: bytes) -> tuple[bytes, bool, bool]:
+        """Returns (bytes to send, leave?, show help?)."""
+        out = bytearray()
+        quit_, help_ = False, False
+        for byte in data:
+            ch = bytes([byte])
+            if quit_:
+                break
+            if self.armed:
+                self.armed = False
+                if ch in QUIT_KEYS:
+                    quit_ = True
+                elif ch == ESCAPE:
+                    out += ESCAPE
+                elif ch in HELP_KEYS:
+                    help_ = True
+                continue
+            if ch == ESCAPE:
+                self.armed = True
+            else:
+                out += ch
+        return bytes(out), quit_, help_
+
+
 def _session_loop(sock: socket.socket, timestamps: bool, input_fd: int,
                   output_fd: int, pending_input: bytes = b"") -> str:
     """Run one attached session. Returns ``"detached"`` or ``"lost"``.
@@ -448,6 +486,7 @@ def _session_loop(sock: socket.socket, timestamps: bool, input_fd: int,
     terminal_owner = True
     query_filter = _TerminalQueryFilter()
     last_output_was_newline = True
+    keys = EscapeKeys()
 
     if pending_input:
         try:
@@ -463,11 +502,18 @@ def _session_loop(sock: socket.socket, timestamps: bool, input_fd: int,
 
         if sys.stdin in readable:
             try:
-                ch = os.read(input_fd, 1)
+                typed = os.read(input_fd, 1)
             except OSError:
                 return "detached"
-            if not ch or ch == b"\x1d":  # EOF or Ctrl+]
+            if not typed:                 # EOF
                 return "detached"
+            ch, leave, show_help = keys.feed(typed)
+            if show_help:
+                os.write(output_fd, ESCAPE_HELP.encode())
+            if leave:
+                return "detached"
+            if not ch:
+                continue
 
             # If timestamps enabled, handle input newline
             if timestamps and ch in (b"\r", b"\n"):
@@ -544,12 +590,12 @@ def _session_loop(sock: socket.socket, timestamps: bool, input_fd: int,
                 sock.setblocking(False)
 
 
-def _wait_before_retry(input_fd: int, seconds: float) -> tuple[bool, bytes]:
+def _wait_before_retry(input_fd: int, seconds: float, keys: "EscapeKeys | None" = None) -> tuple[bool, bytes]:
     """Wait up to ``seconds`` before the next reconnect attempt.
 
     Returns ``(keep_going, typed)``. Any key cuts the wait short so pressing
     Enter retries immediately; the keys are returned to be replayed once the
-    session is back. Ctrl+] (or EOF) gives up.
+    session is back. Ctrl-A Ctrl-X (or EOF) gives up.
     """
     deadline = time.monotonic() + seconds
     while True:
@@ -565,9 +611,14 @@ def _wait_before_retry(input_fd: int, seconds: float) -> tuple[bool, bytes]:
                 data = os.read(input_fd, 64)
             except OSError:
                 return False, b""
-            if not data or b"\x1d" in data:
+            if not data:
                 return False, b""
-            return True, data
+            typed, leave, _ = (keys or EscapeKeys()).feed(data)
+            if leave:
+                return False, b""
+            if not typed:                 # only the start of an escape: keep waiting for its command
+                continue
+            return True, typed
 
 
 def _should_reconnect(config: Config, attempt: int) -> bool:
@@ -592,6 +643,7 @@ def interactive_mode(config: Config, alias: str, timestamps: bool = False,
     exit_message = None
     attempt = 0
     pending = b""
+    waiting_keys = EscapeKeys()      # keys typed while reconnecting, read like the session's
 
     try:
         tty.setraw(input_fd)
@@ -607,8 +659,8 @@ def interactive_mode(config: Config, alias: str, timestamps: bool = False,
                     break
                 attempt += 1
                 if attempt == 1 or pending:
-                    _write_status(output_fd, f"{e}; reconnecting (Enter = retry now, Ctrl+] = quit)")
-                keep_going, typed = _wait_before_retry(input_fd, getattr(config, "client_reconnect_interval", 1.0))
+                    _write_status(output_fd, f"{e}; reconnecting (Enter = retry now, Ctrl-A Ctrl-X = quit)")
+                keep_going, typed = _wait_before_retry(input_fd, getattr(config, "client_reconnect_interval", 1.0), waiting_keys)
                 if not keep_going:
                     exit_message = "detached"
                     break
@@ -616,7 +668,7 @@ def interactive_mode(config: Config, alias: str, timestamps: bool = False,
                 continue
             except (OSError, EOFError) as e:
                 attempt += 1
-                keep_going, typed = _wait_before_retry(input_fd, getattr(config, "client_reconnect_interval", 1.0))
+                keep_going, typed = _wait_before_retry(input_fd, getattr(config, "client_reconnect_interval", 1.0), waiting_keys)
                 if not keep_going:
                     exit_message = "detached"
                     break
@@ -630,7 +682,7 @@ def interactive_mode(config: Config, alias: str, timestamps: bool = False,
             _replay_history(history_msg, timestamps, output_fd)
             print(
                 f"\r\n--- serial-mux: attached to {alias} "
-                f"[{transport}] (Ctrl+] to detach) ---\r\n",
+                f"[{transport}] (Ctrl-A Ctrl-X to detach) ---\r\n",
                 end="",
                 flush=True,
             )

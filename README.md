@@ -261,7 +261,7 @@ Timestamps are off by default.
 
 #### Detaching
 
-Press `Ctrl+]` to detach from an interactive session. The daemon keeps running — you can reattach at any time.
+Press `Ctrl-A Ctrl-X` (or `Ctrl-A Ctrl-Q`) to detach from an interactive session, as in picocom; `Ctrl-C` and every other key go to the board, `Ctrl-A Ctrl-A` sends a `Ctrl-A`. The daemon keeps running — you can reattach at any time.
 
 ### Non-Interactive Mode
 
@@ -286,7 +286,7 @@ Flags:
 When the daemon has SSH bound, clients automatically use the SSH transport. The interactive attach banner shows the current transport:
 
 ```
---- serial-mux: attached to die0 [ssh] (Ctrl+] to detach) ---
+--- serial-mux: attached to die0 [ssh] (Ctrl-A Ctrl-X to detach) ---
 ```
 
 If SSH drops mid-session, the daemon switches to serial automatically and notifies all clients.
@@ -411,7 +411,7 @@ serial-mux start /dev/ttyUSB0 --baud 115200 --alias die0
 
 # Attach interactively as a user
 smtty die0
-# (type commands, see output, Ctrl+] to detach)
+# (type commands, see output, Ctrl-A Ctrl-X to detach)
 
 # In another terminal, attach another client
 smtty die0

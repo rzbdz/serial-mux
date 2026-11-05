@@ -122,7 +122,7 @@ daemon 不需要在运行中，直接读取日志文件。
 
 ### 3. 断开连接
 
-交互模式下按 `Ctrl+]` detach，daemon 不受影响，其他客户端继续工作。
+交互模式下按 `Ctrl-A Ctrl-X` detach（和 picocom 一样；Ctrl-C 会发给板子），daemon 不受影响，其他客户端继续工作。
 
 ### 4. 停止 daemon
 
@@ -209,7 +209,7 @@ smtty die0 --send "ls" --wait "root@" --timeout 5
 daemon 绑定 SSH 后，客户端自动优先使用 SSH。交互模式的 attach banner 会显示当前传输层：
 
 ```
---- serial-mux: attached to die0 [ssh] (Ctrl+] to detach) ---
+--- serial-mux: attached to die0 [ssh] (Ctrl-A Ctrl-X to detach) ---
 ```
 
 SSH 连接断开时 daemon 自动切换到串口并通知所有客户端。
@@ -247,7 +247,7 @@ SSH target 支持两种格式：
 
 ### Detach
 
-交互模式下按 `Ctrl+]` 断开客户端连接，daemon 继续运行。
+交互模式下按 `Ctrl-A Ctrl-X`（或 `Ctrl-A Ctrl-Q`）断开客户端连接，和 picocom 一样；`Ctrl-C` 等其他按键都发给板子，`Ctrl-A Ctrl-A` 发送 `Ctrl-A`。daemon 继续运行。
 
 ## alias 机制
 

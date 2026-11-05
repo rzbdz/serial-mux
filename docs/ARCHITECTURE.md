@@ -75,7 +75,7 @@ smtty <alias> --token <token>                          # 闸门开启时带 toke
 
 ### detach
 
-- 交互模式下 Ctrl+] detach，不影响 daemon
+- 交互模式下 Ctrl-A Ctrl-X detach（同 picocom），不影响 daemon
 
 ## SSH 绑定
 
@@ -153,8 +153,8 @@ alias 映射存储在 `~/.serial-mux/run/<alias>.json`：
 attach banner 显示当前传输层：
 
 ```
---- serial-mux: attached to die0 [ssh] (Ctrl+] to detach) ---
---- serial-mux: attached to die0 [serial] (Ctrl+] to detach) ---
+--- serial-mux: attached to die0 [ssh] (Ctrl-A Ctrl-X to detach) ---
+--- serial-mux: attached to die0 [serial] (Ctrl-A Ctrl-X to detach) ---
 ```
 
 ### 输入

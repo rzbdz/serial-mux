@@ -117,7 +117,7 @@ def test_interactive_mode_claims_terminal_and_restores_on_detach(
         "write",
         lambda fd, data: terminal_writes.append(bytes(data)) or len(data),
     )
-    monkeypatch.setattr(client.os, "read", lambda fd, size: b"\x1d")
+    monkeypatch.setattr(client.os, "read", lambda fd, size: b"\x01\x18")
     monkeypatch.setattr(
         client.select,
         "select",
@@ -163,7 +163,7 @@ def test_interactive_mode_says_once_that_input_is_locked(monkeypatch):
     monkeypatch.setattr(client.sys, "stdout", fake_stdout)
     monkeypatch.setattr(client.os, "isatty", lambda fd: True)
     monkeypatch.setattr(client.os, "write", lambda fd, data: terminal_writes.append(bytes(data)) or len(data))
-    monkeypatch.setattr(client.os, "read", lambda fd, size: b"\x1d")
+    monkeypatch.setattr(client.os, "read", lambda fd, size: b"\x01\x18")
     monkeypatch.setattr(client.select, "select", lambda *args: (next(ready), [], []))
     monkeypatch.setattr(client.termios, "tcgetattr", lambda fd: "saved")
     monkeypatch.setattr(client.termios, "tcsetattr", lambda fd, when, value: None)
@@ -285,7 +285,7 @@ def test_enter_while_daemon_is_down_retries_at_once_and_is_replayed(monkeypatch)
     fake_stdout = FakeTTY(11)
     attempts = []
     sent = []
-    keys = iter([b"\r", b"\x1d"])
+    keys = iter([b"\r", b"\x01", b"\x18"])
 
     def fake_connect(config, alias, interactive=False, token=None):
         attempts.append(_time.monotonic())
@@ -311,3 +311,15 @@ def test_enter_while_daemon_is_down_retries_at_once_and_is_replayed(monkeypatch)
 
     assert len(attempts) == 2 and attempts[1] - attempts[0] < 1.0   # did not wait 30s
     assert sent and sent[0] == {"type": "input", "data": client.b64(b"\r")}
+
+
+def test_escape_keys_read_like_picocom():
+    from serial_mux.client import EscapeKeys
+
+    keys = EscapeKeys()
+    assert keys.feed(b"ls\x03\x1d") == (b"ls\x03\x1d", False, False)     # Ctrl-C and Ctrl-] go to the board
+    assert keys.feed(b"\x01\x01x") == (b"\x01x", False, False)
+    assert keys.feed(b"\x01") == (b"", False, False)                    # escape and command in separate reads
+    assert keys.feed(b"\x18rest") == (b"", True, False)
+    assert EscapeKeys().feed(b"\x01?") == (b"", False, True)
+    assert EscapeKeys().feed(b"\x01\x11")[1] is True
