@@ -10,7 +10,7 @@ class TestConfigDefaults:
         cfg = Config()
         assert cfg.log_retention_days == 7
         assert cfg.default_baud == 115200
-        assert cfg.scrollback_lines == 5000
+        assert cfg.scrollback_lines == 100_000
         assert cfg.ssh_connect_timeout == 3
         assert cfg.ssh_probe_timeout == 5
 
@@ -84,3 +84,10 @@ class TestEnsureDirs:
         cfg.ensure_dirs()
         cfg.ensure_dirs()  # no error on second call
         assert cfg.run_dir.exists()
+
+
+def test_a_timeout_keeps_scripts_clean_and_gives_advice_only_when_asked():
+    from serial_mux.client import _last_lines
+    text = "\n".join(f"line {i}" for i in range(1, 101))
+    assert _last_lines(text, 3) == "line 98\nline 99\nline 100"
+    assert _last_lines("", 5) == ""
