@@ -710,9 +710,16 @@ def _exit_rejected(sock: socket.socket, msg: dict):
     sys.exit(3)
 
 
+def _last_lines(text: str, n: int) -> str:
+    """The last `n` lines of console output, for a timeout's short look back."""
+    lines = text.splitlines()
+    return "\n".join(lines[-n:]) if lines else ""
+
+
 def noninteractive_mode(config: Config, alias: str,
                          send_cmd: str, wait_pattern: str = None,
-                         timeout: float = 10.0, token: str | None = None):
+                         timeout: float = 10.0, token: str | None = None,
+                         advice: bool = False, tail_lines: int = 40):
     """Non-interactive mode: send a command once, then wait for output."""
     try:
         sock, _transport = connect(config, alias, token=token)
@@ -765,9 +772,16 @@ def noninteractive_mode(config: Config, alias: str,
                 except Exception:
                     pass
 
-        # Timeout
-        _print_output(all_output, send_cmd)
-        print(f"\nError: Timeout waiting for '{wait_pattern}'", file=sys.stderr)
+        # Timeout. Scripts get the output and the error as before; `--advice` (for an AI driving it) gives the
+        # last few lines and how to go on instead.
+        if advice:
+            tail = _last_lines(all_output, tail_lines)
+            print(f"--- last {tail_lines} line(s) of the console after {timeout:g}s (no match for {wait_pattern!r}) ---", file=sys.stderr)
+            print(tail if tail else "(no output)", file=sys.stderr)
+            print(f"--- still waiting? run it again with --timeout 30; look further back: smtty {alias} --tail 200", file=sys.stderr)
+        else:
+            _print_output(all_output, send_cmd)
+            print(f"\nError: Timeout waiting for '{wait_pattern}'", file=sys.stderr)
         sock.close()
         sys.exit(2)
     else:
@@ -849,6 +863,11 @@ def main():
     parser.add_argument("--tail", type=int, nargs="?", const=50, default=None,
                         metavar="N",
                         help="Print last N lines from log and exit (default: 50)")
+    parser.add_argument("--advice", action="store_true", default=False,
+                        help="With --wait, on timeout: show the last lines and how to go on (for an AI driving it), "
+                             "instead of the command's output")
+    parser.add_argument("--tail-lines", type=int, default=40, metavar="N",
+                        help="With --advice: how many lines a timeout shows (default: 40)")
     parser.add_argument("--token", default=os.environ.get("SERIAL_MUX_TOKEN"),
                         help="Token for a daemon whose input gate is on "
                              "(default: $SERIAL_MUX_TOKEN)")
@@ -863,7 +882,9 @@ def main():
                            send_cmd=args.send,
                            wait_pattern=args.wait,
                            timeout=args.timeout,
-                           token=args.token)
+                           token=args.token,
+                           advice=args.advice,
+                           tail_lines=args.tail_lines)
     else:
         if not sys.stdin.isatty():
             print("Error: Interactive mode requires a terminal", file=sys.stderr)

@@ -166,6 +166,7 @@ die1         /dev/ttyUSB1  115200  -  -  -  saved  -
 | `smtty <alias> --timestamps` | 交互模式，显示时间戳 |
 | `smtty <alias> --tail [N]` | 打印最后 N 行日志并退出（默认 50） |
 | `smtty <alias> --send 'cmd' --wait 'pattern' --timeout 5` | 非交互模式 |
+| `smtty <alias> --send 'cmd' --wait 'pattern' --advice` | 超时时给出最后几行和下一步建议（给 AI 用；脚本不带，输出保持原样） |
 | `smtty <alias> --token <token>` | 闸门开启时带上 token 才能输入（也可用环境变量 `SERIAL_MUX_TOKEN`） |
 
 ### 输入闸门（可选）

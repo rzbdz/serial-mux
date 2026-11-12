@@ -3,6 +3,7 @@
 import json
 import os
 import pty
+import pytest
 import select
 import termios
 import tty
@@ -201,6 +202,37 @@ def test_noninteractive_sends_once_without_echo(monkeypatch):
 
     assert writes == [{"type": "input", "data": b64(b"reboot\r")}]
     assert sock.closed is True
+
+
+def test_a_timeout_leaves_scripts_clean_and_gives_advice_only_when_asked(monkeypatch, capsys):
+    """Scripts get the output and the error; only --advice adds the look-back and how to go on."""
+    sock = FakeSocket()
+    messages = iter([{"type": "history", "lines": []}])
+    monkeypatch.setattr(client, "connect", lambda config, alias, token=None: (sock, "serial"))
+    monkeypatch.setattr(
+        client, "sync_read_msg",
+        lambda current_sock: next(messages, {"type": "output", "data": b64(b"")}),
+    )
+    monkeypatch.setattr(client, "sync_write_msg", lambda current_sock, message: None)
+    monkeypatch.setattr(client.select, "select", lambda *args: ([], [], []))
+
+    with pytest.raises(SystemExit) as stopped:
+        client.noninteractive_mode(object(), "port", "reboot", wait_pattern="READY", timeout=0.01)
+    assert stopped.value.code == 2
+    plain = capsys.readouterr()
+    assert "Error: Timeout waiting for 'READY'" in plain.err
+    assert "still waiting?" not in plain.err
+
+    with pytest.raises(SystemExit) as stopped:
+        client.noninteractive_mode(
+            object(), "port", "reboot", wait_pattern="READY", timeout=0.01,
+            advice=True, tail_lines=2,
+        )
+    assert stopped.value.code == 2
+    advised = capsys.readouterr()
+    assert "still waiting? run it again with --timeout 30" in advised.err
+    assert "smtty port --tail 200" in advised.err
+    assert "Error: Timeout" not in advised.err
 
 
 def test_auto_resume_keeps_saved_mapping(tmp_config, tmp_path, monkeypatch):

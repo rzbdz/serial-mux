@@ -279,6 +279,9 @@ Flags:
 - `--send` / `-s` — command string to send
 - `--wait` / `-w` — regex/string pattern to wait for in output
 - `--timeout` / `-t` — seconds to wait for the pattern (default: 10)
+- `--advice` — on timeout, show the console's last lines and how to go on (for an AI driving it). Without it, a
+  script gets the command's output and the error exactly as before; nothing is added to what it parses.
+- `--tail-lines N` — with `--advice`, how many lines a timeout shows (default: 40)
 - `--token` — token for a daemon whose [input gate](#input-gate-optional) is on (default: `$SERIAL_MUX_TOKEN`); interactive mode accepts it too
 
 #### SSH transport
