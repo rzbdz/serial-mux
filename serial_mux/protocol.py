@@ -51,7 +51,8 @@ CAPABILITIES = ["input-gate"]
 
 HEADER_FMT = "!I"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
-MAX_MSG_SIZE = 1024 * 1024  # 1MB
+# History is sent as one message: big enough for a long console (a long boot log), still bounded.
+MAX_MSG_SIZE = 16 * 1024 * 1024  # 16MB
 
 
 def encode_msg(msg: dict) -> bytes:

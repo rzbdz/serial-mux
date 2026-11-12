@@ -11,7 +11,7 @@ import yaml
 class Config:
     log_retention_days: int = 7
     default_baud: int = 115200
-    scrollback_lines: int = 5000
+    scrollback_lines: int = 100_000
     ssh_connect_timeout: int = 3
     ssh_probe_timeout: int = 5
     # Seconds between background probes for a lost USB serial port (the
