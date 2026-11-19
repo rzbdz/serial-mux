@@ -191,3 +191,45 @@ class TestDaemonLogging:
         content = logs[0].read_text()
         assert "log-test-line" in content
         sock.close()
+
+
+@pytest.fixture
+def long_log(tmp_config):
+    """A console that printed 16,000 lines today, before its daemon starts."""
+    from datetime import datetime
+
+    log_dir = tmp_config.logs_dir / "test0"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [f"[{stamp}] boot line {i:05d} " + "x" * 60 for i in range(16000)]
+    (log_dir / f"{datetime.now():%Y-%m-%d}.log").write_text("\n".join(lines) + "\n")
+    return lines
+
+
+@pytest.mark.timeout(30)
+class TestDaemonHistory:
+    def test_a_client_gets_a_bounded_history_of_the_newest_lines(self, long_log, daemon_foreground):
+        """A long scrollback is not sent whole: the newest lines, at most 5,000 and 512 KB."""
+        proc, alias, config, pty_peer = daemon_foreground
+        sock, _, history = connect_to_daemon(config, alias)
+        sock.close()
+        lines = history["lines"]
+        assert 0 < len(lines) <= 5000
+        assert len(json.dumps(history, ensure_ascii=False).encode()) <= 512 * 1024
+        assert lines == long_log[-len(lines):]          # the newest, in order
+
+
+def test_bounded_history_trims_the_oldest_first_by_lines_and_bytes():
+    from serial_mux.daemon import bounded_history
+
+    lines = [f"line {i} é" for i in range(100)]
+    assert bounded_history(lines, 10, 1 << 20) == lines[-10:]
+    assert bounded_history(lines, 0, 1 << 20) == []
+    assert bounded_history([], 10, 1 << 20) == []
+    assert bounded_history(lines, 1000, 1500) == lines          # all of it fits
+    assert bounded_history(lines, 1000, 20) == []                # not even the message around one line
+    for limit in (60, 200, 1000):
+        got = bounded_history(lines, 1000, limit)
+        size = len(json.dumps({"type": "history", "lines": got}, ensure_ascii=False).encode())
+        more = len(json.dumps({"type": "history", "lines": lines[-len(got) - 1:]}, ensure_ascii=False).encode())
+        assert got == lines[len(lines) - len(got):] and size <= limit < more

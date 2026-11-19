@@ -12,6 +12,10 @@ class Config:
     log_retention_days: int = 7
     default_baud: int = 115200
     scrollback_lines: int = 100_000
+    # What a client is sent when it connects: the newest lines of the
+    # scrollback, at most this many, in a message of at most this many bytes.
+    history_lines: int = 5000
+    history_bytes: int = 512 * 1024
     ssh_connect_timeout: int = 3
     ssh_probe_timeout: int = 5
     # Seconds between background probes for a lost USB serial port (the
@@ -69,6 +73,8 @@ class Config:
                 ("serial_input_hold_s", float),
                 ("client_reconnect_interval", float),
                 ("client_reconnect_attempts", int),
+                ("history_lines", int),
+                ("history_bytes", int),
             ):
                 if key in data:
                     setattr(cfg, key, cast(data[key]))

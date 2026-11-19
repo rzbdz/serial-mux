@@ -331,8 +331,13 @@ log_retention_days: 7
 # Default baud rate when --baud is not specified
 default_baud: 115200
 
-# Number of history lines replayed when a client attaches
-scrollback_lines: 5000
+# Number of lines the daemon keeps in memory
+scrollback_lines: 100000
+
+# What a client is sent when it attaches: the newest lines, at most this many,
+# in a message of at most this many bytes (the oldest are left out first)
+history_lines: 5000
+history_bytes: 524288
 
 # SSH ConnectTimeout passed to ssh (seconds)
 ssh_connect_timeout: 3
@@ -391,7 +396,7 @@ by the current sysfs reverse lookup.
 - Logs are split by alias and date: `~/.serial-mux/logs/<alias>/YYYY-MM-DD.log`
 - The daemon automatically purges logs older than `log_retention_days` on startup
 - No cron job needed
-- When a client attaches, the last `scrollback_lines` lines from the log are replayed to stdout, giving you full history in your terminal/tmux scrollback
+- When a client attaches, the newest lines (at most `history_lines`, and `history_bytes` of message) are replayed to stdout, into your terminal/tmux scrollback; the log files hold the rest
 
 ## Alias System
 

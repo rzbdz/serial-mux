@@ -62,6 +62,24 @@ def validate_ssh_target(target: str) -> tuple[bool, str]:
         return False, f"Error reading ~/.ssh/config: {e}"
 
 
+def bounded_history(lines: list[str], max_lines: int, max_bytes: int) -> list[str]:
+    """The newest of `lines` one history message carries: at most `max_lines` lines and at most `max_bytes`
+    of encoded message, the oldest left out first. Each line is measured once, newest first."""
+    overhead = len(json.dumps({"type": "history", "lines": []}, ensure_ascii=False).encode("utf-8"))
+    budget = max_bytes - overhead
+    if max_lines <= 0 or budget <= 0:
+        return []
+    size, start = 0, len(lines)
+    for i in range(len(lines) - 1, max(-1, len(lines) - 1 - max_lines), -1):
+        # the line as a JSON string, and the ", " between it and the line after it
+        cost = len(json.dumps(lines[i], ensure_ascii=False).encode("utf-8")) + (2 if start < len(lines) else 0)
+        if size + cost > budget:
+            break
+        size += cost
+        start = i
+    return lines[start:]
+
+
 class SerialDaemon:
     def __init__(self, device: Optional[str], baud: int, alias: str, config: Config,
                  usb_port: Optional[str] = None):
@@ -503,19 +521,11 @@ class SerialDaemon:
                 "gate_note": self._gate_note,
             })
 
-            # Send history
-            history = self._load_history()
-            # Also include current ring buffer lines not yet in log
-            all_lines = history
-            if self.log_lines:
-                # Merge: use ring buffer as it's more current
-                all_lines = self.log_lines[-self.config.scrollback_lines:]
-            # Trim oldest lines until the JSON payload fits in one message
-            while all_lines:
-                if len(json.dumps({"type": "history", "lines": all_lines}).encode()) <= MAX_MSG_SIZE:
-                    break
-                all_lines = all_lines[len(all_lines) // 4 + 1:]
-            await async_write_msg(writer, {"type": "history", "lines": all_lines})
+            # Send history: the newest lines, as many as the history bounds allow (the ring buffer is
+            # more current than the log files when it has lines). A client that wants more reads the log.
+            all_lines = self.log_lines or self._load_history()
+            await async_write_msg(writer, {"type": "history", "lines": bounded_history(
+                all_lines, self.config.history_lines, min(self.config.history_bytes, MAX_MSG_SIZE))})
 
             # Main client loop
             while self.running:
